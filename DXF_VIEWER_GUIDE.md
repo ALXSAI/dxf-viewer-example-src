@@ -504,13 +504,35 @@ await viewer.Load({ url, fonts, workerFactory })
 
 ## Vue 2 Integration
 
-### DxfViewer.vue
+The recommended pattern splits the viewer into two components:
+
+1. `DxfViewer.vue` — wraps the raw `DxfViewer` class, manages loading state, re-emits events
+2. `ViewerPage.vue` — orchestrates the viewer component with a layers sidebar
+
+### DxfViewer.vue (low-level wrapper)
+
+This component matches the pattern used in the official example app. It accepts a `dxfUrl` prop, handles loading/error state, and proxies all DXF events with a `dxf-` prefix.
 
 ```vue
 <template>
-  <div class="viewer-container" ref="container">
-    <div v-if="loading" class="loading">Loading...</div>
-    <div v-if="error" class="error">{{ error }}</div>
+  <div class="canvasContainer" ref="canvasContainer">
+    <!-- Loading spinner -->
+    <div v-if="isLoading" class="loading-overlay">Loading...</div>
+
+    <!-- Progress bar -->
+    <div v-if="progress !== null" class="progress">
+      <div
+        class="progress-bar"
+        :class="{ indeterminate: progress < 0 }"
+        :style="progress >= 0 ? { width: (progress * 100) + '%' } : {}"
+      ></div>
+      <div v-if="progressText" class="progress-text">{{ progressText }}</div>
+    </div>
+
+    <!-- Error display -->
+    <div v-if="error !== null" class="error">
+      Error: {{ error }}
+    </div>
   </div>
 </template>
 
@@ -518,107 +540,467 @@ await viewer.Load({ url, fonts, workerFactory })
 import { DxfViewer } from "dxf-viewer"
 import * as THREE from "three"
 import DxfViewerWorker from "worker-loader!./DxfViewerWorker"
-import mainFont from "./fonts/Roboto-LightItalic.ttf"
+
+/**
+ * Emits all DxfViewer events prefixed with "dxf-":
+ *   dxf-loaded, dxf-cleared, dxf-destroyed, dxf-resized,
+ *   dxf-pointerdown, dxf-pointerup, dxf-viewChanged, dxf-message
+ */
+export default {
+  name: "DxfViewer",
+
+  props: {
+    /** URL of the DXF file to load. Set to null to clear. */
+    dxfUrl: {
+      default: null,
+    },
+    /**
+     * Array of TTF font file URLs.
+     * Fonts are tried in order until a glyph is found.
+     * Text is not rendered if this is null or empty.
+     */
+    fonts: {
+      default: null,
+    },
+    /** DxfViewer constructor options. */
+    options: {
+      default() {
+        return {
+          clearColor: new THREE.Color("#ffffff"),
+          autoResize: true,
+          colorCorrection: true,
+          sceneOptions: {
+            wireframeMesh: true,
+          },
+        }
+      },
+    },
+  },
+
+  data() {
+    return {
+      isLoading: false,
+      progress: null,
+      progressText: null,
+      curProgressPhase: null,
+      error: null,
+    }
+  },
+
+  watch: {
+    async dxfUrl(dxfUrl) {
+      if (dxfUrl !== null) {
+        await this._Load(dxfUrl)
+      } else {
+        this.dxfViewer.Clear()
+        this.error = null
+        this.isLoading = false
+        this.progress = null
+      }
+    },
+  },
+
+  methods: {
+    async _Load(url) {
+      this.isLoading = true
+      this.error = null
+      try {
+        await this.dxfViewer.Load({
+          url,
+          fonts: this.fonts,
+          progressCbk: this._OnProgress.bind(this),
+          workerFactory: DxfViewerWorker,
+        })
+      } catch (error) {
+        console.warn(error)
+        this.error = error.toString()
+      } finally {
+        this.isLoading = false
+        this.progressText = null
+        this.progress = null
+        this.curProgressPhase = null
+      }
+    },
+
+    /** Expose the underlying DxfViewer instance for parent components. */
+    GetViewer() {
+      return this.dxfViewer
+    },
+
+    _OnProgress(phase, size, totalSize) {
+      if (phase !== this.curProgressPhase) {
+        switch (phase) {
+          case "font":    this.progressText = "Fetching fonts...";            break
+          case "fetch":   this.progressText = "Fetching file...";             break
+          case "parse":   this.progressText = "Parsing file...";              break
+          case "prepare": this.progressText = "Preparing rendering data...";  break
+        }
+        this.curProgressPhase = phase
+      }
+      this.progress = totalSize === null ? -1 : size / totalSize
+    },
+  },
+
+  mounted() {
+    this.dxfViewer = new DxfViewer(this.$refs.canvasContainer, this.options)
+
+    // Proxy all DXF viewer events as Vue events with "dxf-" prefix
+    const eventNames = [
+      "loaded", "cleared", "destroyed", "resized",
+      "pointerdown", "pointerup", "viewChanged", "message",
+    ]
+    for (const eventName of eventNames) {
+      this.dxfViewer.Subscribe(eventName, (e) => this.$emit("dxf-" + eventName, e))
+    }
+
+    // Load immediately if url was already set
+    if (this.dxfUrl) {
+      this._Load(this.dxfUrl)
+    }
+  },
+
+  destroyed() {
+    this.dxfViewer.Destroy()
+    this.dxfViewer = null
+  },
+}
+</script>
+
+<style scoped>
+.canvasContainer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 100px;
+  min-height: 100px;
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.progress {
+  position: absolute;
+  z-index: 20;
+  width: 90%;
+  margin: 20px 5%;
+}
+
+.progress-bar {
+  height: 4px;
+  background: #1976d2;
+  transition: width 0.2s;
+}
+
+.progress-bar.indeterminate {
+  width: 40%;
+  animation: indeterminate 1.4s infinite linear;
+}
+
+@keyframes indeterminate {
+  0%   { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+
+.progress-text {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #333;
+  text-align: center;
+}
+
+.error {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  padding: 24px;
+  color: #c00;
+  font-weight: 500;
+}
+</style>
+```
+
+### ViewerPage.vue (viewer + layers panel)
+
+This page-level component wires together the `DxfViewer` wrapper with a layers toggle UI and message notifications — exactly the pattern used in the example app.
+
+```vue
+<template>
+  <div class="viewer-page">
+    <!-- DXF canvas -->
+    <div class="viewer-area">
+      <DxfViewer
+        ref="viewer"
+        :dxfUrl="dxfUrl"
+        :fonts="fonts"
+        @dxf-loaded="_OnLoaded"
+        @dxf-cleared="_OnCleared"
+        @dxf-message="_OnMessage"
+      />
+    </div>
+
+    <!-- Layers sidebar -->
+    <div class="layers-panel" v-if="layers !== null">
+      <h3>Layers</h3>
+
+      <label class="layer-row">
+        <input type="checkbox" v-model="allVisible" @change="_ToggleAll" />
+        <em>All layers</em>
+      </label>
+
+      <label
+        class="layer-row"
+        v-for="layer in layers"
+        :key="layer.name"
+      >
+        <span
+          class="color-swatch"
+          :style="{ background: _LayerCss(layer.color) }"
+        ></span>
+        <input
+          type="checkbox"
+          :checked="layer.isVisible"
+          @change="e => _ToggleLayer(layer, e.target.checked)"
+        />
+        {{ layer.displayName }}
+      </label>
+    </div>
+  </div>
+</template>
+
+<script>
+import DxfViewer from "./DxfViewer.vue"
+import { DxfViewer as _DxfViewer } from "dxf-viewer"
+
+// Font imports (webpack resolves these to asset URLs)
+import mainFont from "@/assets/fonts/Roboto-LightItalic.ttf"
+import aux1Font from "@/assets/fonts/NotoSansDisplay-SemiCondensedLightItalic.ttf"
+import aux2Font from "@/assets/fonts/HanaMinA.ttf"
+import aux3Font from "@/assets/fonts/NanumGothic-Regular.ttf"
 
 export default {
+  name: "ViewerPage",
+  components: { DxfViewer },
+
   props: {
     dxfUrl: { type: String, default: null },
   },
 
   data() {
-    return { loading: false, error: null }
-  },
-
-  watch: {
-    async dxfUrl(url) {
-      if (url) await this.load(url)
-      else this.viewer.Clear()
+    return {
+      layers: null,
+      allVisible: true,
     }
   },
 
+  created() {
+    // Build font stack once at creation time
+    this.fonts = [mainFont, aux1Font, aux2Font, aux3Font]
+  },
+
   methods: {
-    async load(url) {
-      this.loading = true
-      this.error = null
-      try {
-        await this.viewer.Load({
-          url,
-          fonts: [mainFont],
-          workerFactory: DxfViewerWorker,
-        })
-      } catch (e) {
-        this.error = e.message
-      } finally {
-        this.loading = false
+    _OnLoaded() {
+      // Fetch all layers (including hidden) after load
+      const layers = this.$refs.viewer.GetViewer().GetLayers(true)
+      // Add reactive isVisible flag to each layer
+      layers.forEach(lyr => { lyr.isVisible = true })
+      this.layers = layers
+      this.allVisible = true
+    },
+
+    _OnCleared() {
+      this.layers = null
+    },
+
+    _OnMessage(e) {
+      const { level, message } = e.detail
+      const isError = level === _DxfViewer.MessageLevel.ERROR
+      console[isError ? "error" : "warn"]("[dxf-viewer]", message)
+      // Replace with your notification library:
+      // this.$toast[isError ? 'error' : 'warning'](message)
+    },
+
+    _ToggleLayer(layer, newState) {
+      layer.isVisible = newState
+      this.$refs.viewer.GetViewer().ShowLayer(layer.name, newState)
+    },
+
+    _ToggleAll(e) {
+      const newState = e.target.checked
+      if (this.layers) {
+        for (const layer of this.layers) {
+          if (layer.isVisible !== newState) {
+            this._ToggleLayer(layer, newState)
+          }
+        }
       }
     },
 
-    getViewer() { return this.viewer }
+    _LayerCss(colorInt) {
+      return "#" + colorInt.toString(16).padStart(6, "0")
+    },
   },
-
-  mounted() {
-    this.viewer = new DxfViewer(this.$refs.container, {
-      clearColor: new THREE.Color("#fff"),
-      autoResize: true,
-      colorCorrection: true,
-    })
-
-    this.viewer.Subscribe("loaded",  e => this.$emit("loaded",  e))
-    this.viewer.Subscribe("cleared", e => this.$emit("cleared", e))
-    this.viewer.Subscribe("message", e => this.$emit("message", e))
-
-    if (this.dxfUrl) this.load(this.dxfUrl)
-  },
-
-  destroyed() {
-    this.viewer.Destroy()
-  }
 }
 </script>
 
 <style scoped>
-.viewer-container {
-  position: relative;
+.viewer-page {
+  display: flex;
   width: 100%;
   height: 100%;
-  min-height: 100px;
 }
-.loading {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+
+.viewer-area {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+
+.layers-panel {
+  width: 260px;
+  border-left: 1px solid #ddd;
+  overflow-y: auto;
+  padding: 8px;
+  flex-shrink: 0;
+}
+
+.layers-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.color-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
 }
 </style>
+```
+
+### Using ViewerPage in App.vue
+
+```vue
+<template>
+  <div style="height: 100vh; display: flex; flex-direction: column;">
+    <header style="padding: 8px 16px; background: #1976d2; color: #fff;">
+      <input type="file" accept=".dxf" @change="_OnFileSelected" />
+    </header>
+    <div style="flex: 1; overflow: hidden;">
+      <ViewerPage :dxfUrl="dxfUrl" />
+    </div>
+  </div>
+</template>
+
+<script>
+import ViewerPage from "@/components/ViewerPage"
+
+export default {
+  components: { ViewerPage },
+  data() {
+    return { dxfUrl: null, _blobUrl: null }
+  },
+  methods: {
+    _OnFileSelected(e) {
+      const file = e.target.files[0]
+      if (!file) return
+      if (this._blobUrl) URL.revokeObjectURL(this._blobUrl)
+      this._blobUrl = URL.createObjectURL(file)
+      this.dxfUrl = this._blobUrl
+    },
+  },
+  beforeDestroy() {
+    if (this._blobUrl) URL.revokeObjectURL(this._blobUrl)
+  },
+}
+</script>
+```
+
+### vue.config.js for dxf-viewer
+
+```js
+// vue.config.js
+module.exports = {
+  transpileDependencies: [
+    // dxf-viewer uses modern JS that must be transpiled for older browsers
+    /[\\\/]node_modules[\\\/]dxf-viewer[\\\/]/,
+  ],
+}
 ```
 
 ---
 
 ## React Integration
 
+A React functional component wrapping the viewer follows the same lifecycle rules as any imperative DOM library: create in a `useEffect` with an empty dependency array, destroy in the cleanup function, and respond to prop changes in a separate `useEffect`.
+
+### DxfViewer React component (Vite)
+
 ```jsx
-import { useEffect, useRef } from "react"
+// DxfViewerComponent.jsx
+import { useEffect, useRef, useState, useCallback } from "react"
 import { DxfViewer } from "dxf-viewer"
 import * as THREE from "three"
-import mainFont from "./fonts/Roboto-LightItalic.ttf"
 
-// Worker factory (Vite)
-const workerFactory = () => new Worker(
-  new URL("./DxfViewerWorker.js", import.meta.url),
-  { type: "module" }
-)
+// Import fonts as URLs via Vite
+const FONTS = [
+  new URL("./fonts/Roboto-LightItalic.ttf",                         import.meta.url).href,
+  new URL("./fonts/NotoSansDisplay-SemiCondensedLightItalic.ttf",   import.meta.url).href,
+  new URL("./fonts/HanaMinA.ttf",                                   import.meta.url).href,
+  new URL("./fonts/NanumGothic-Regular.ttf",                        import.meta.url).href,
+]
 
-export function DxfViewerComponent({ dxfUrl }) {
+// Worker factory — wrap in a function so each Load() call gets a fresh worker
+const workerFactory = () =>
+  new Worker(new URL("./DxfViewerWorker.js", import.meta.url), { type: "module" })
+
+/**
+ * Props:
+ *   dxfUrl   — string | null   URL to load. Set to null to clear.
+ *   onLayers — function(layers) called after loading with the layer list
+ */
+export function DxfViewerComponent({ dxfUrl, onLayers }) {
   const containerRef = useRef(null)
-  const viewerRef = useRef(null)
+  const viewerRef    = useRef(null)
 
+  const [loading,      setLoading]      = useState(false)
+  const [error,        setError]        = useState(null)
+  const [progress,     setProgress]     = useState(null)
+  const [progressText, setProgressText] = useState(null)
+
+  // Create/destroy viewer
   useEffect(() => {
     const viewer = new DxfViewer(containerRef.current, {
-      clearColor: new THREE.Color("#ffffff"),
-      autoResize: true,
+      clearColor:      new THREE.Color("#ffffff"),
+      autoResize:      true,
       colorCorrection: true,
     })
     viewerRef.current = viewer
+
+    viewer.Subscribe("message", (e) => {
+      const isError = e.detail.level === DxfViewer.MessageLevel.ERROR
+      console[isError ? "error" : "warn"]("[dxf-viewer]", e.detail.message)
+    })
 
     return () => {
       viewer.Destroy()
@@ -626,108 +1008,711 @@ export function DxfViewerComponent({ dxfUrl }) {
     }
   }, [])
 
+  // Progress callback
+  const handleProgress = useCallback((phase, size, totalSize) => {
+    const texts = { font: "Fetching fonts...", fetch: "Fetching file...",
+                    parse: "Parsing file...", prepare: "Preparing rendering data..." }
+    setProgressText(texts[phase] ?? phase)
+    setProgress(totalSize === null ? -1 : size / totalSize)
+  }, [])
+
+  // Load/clear when dxfUrl changes
   useEffect(() => {
     const viewer = viewerRef.current
     if (!viewer) return
 
     if (!dxfUrl) {
       viewer.Clear()
+      setError(null)
+      setLoading(false)
+      setProgress(null)
       return
     }
 
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    setProgress(null)
+
     viewer.Load({
-      url: dxfUrl,
-      fonts: [mainFont],
+      url:           dxfUrl,
+      fonts:         FONTS,
       workerFactory,
-    }).catch(console.error)
-  }, [dxfUrl])
+      progressCbk:   handleProgress,
+    })
+      .then(() => {
+        if (cancelled) return
+        if (onLayers) onLayers(viewer.GetLayers(true))
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setError(err.message)
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false)
+          setProgress(null)
+          setProgressText(null)
+        }
+      })
+
+    return () => { cancelled = true }
+  }, [dxfUrl, handleProgress, onLayers])
 
   return (
-    <div
-      ref={containerRef}
-      style={{ width: "100%", height: "100%", position: "relative" }}
-    />
+    <div ref={containerRef} style={{ position: "relative", width: "100%", height: "100%" }}>
+      {loading && (
+        <div style={overlayStyle}>
+          {progress !== null && (
+            <div style={{ width: "80%", marginBottom: 8 }}>
+              <div style={{
+                height: 4, background: "#1976d2",
+                width: progress < 0 ? "100%" : `${progress * 100}%`,
+                transition: "width 0.2s",
+              }} />
+              {progressText && (
+                <div style={{ fontSize: 13, color: "#555", textAlign: "center", marginTop: 4 }}>
+                  {progressText}
+                </div>
+              )}
+            </div>
+          )}
+          <div>Loading...</div>
+        </div>
+      )}
+      {error && (
+        <div style={{ ...overlayStyle, color: "#c00", background: "rgba(255,255,255,0.85)" }}>
+          Error: {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const overlayStyle = {
+  position: "absolute", inset: 0, zIndex: 10,
+  display: "flex", flexDirection: "column",
+  alignItems: "center", justifyContent: "center",
+  background: "rgba(255,255,255,0.7)",
+}
+```
+
+### Full page with layers sidebar (React)
+
+```jsx
+// App.jsx
+import { useState, useCallback } from "react"
+import { DxfViewerComponent } from "./DxfViewerComponent"
+
+function LayerRow({ layer, onToggle }) {
+  const color = "#" + layer.color.toString(16).padStart(6, "0")
+  return (
+    <label style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0", cursor: "pointer" }}>
+      <span style={{ width: 10, height: 10, background: color, borderRadius: 2, flexShrink: 0 }} />
+      <input
+        type="checkbox"
+        checked={layer.isVisible ?? true}
+        onChange={e => onToggle(layer, e.target.checked)}
+      />
+      <span style={{ fontSize: 13 }}>{layer.displayName}</span>
+    </label>
+  )
+}
+
+export default function App() {
+  const [dxfUrl, setDxfUrl]   = useState(null)
+  const [blobUrl, setBlobUrl] = useState(null)
+  const [layers, setLayers]   = useState(null)
+  const [viewerRef]           = useState({})
+
+  function handleFile(e) {
+    const file = e.target.files[0]
+    if (!file) return
+    if (blobUrl) URL.revokeObjectURL(blobUrl)
+    const url = URL.createObjectURL(file)
+    setBlobUrl(url)
+    setDxfUrl(url)
+    setLayers(null)
+  }
+
+  const handleLayers = useCallback((rawLayers) => {
+    setLayers(rawLayers.map(l => ({ ...l, isVisible: true })))
+  }, [])
+
+  function toggleLayer(layer, newState) {
+    layer.isVisible = newState
+    // Access underlying viewer through the component ref if needed
+    // viewerRef.current?.ShowLayer(layer.name, newState)
+    setLayers(prev => prev.map(l => l.name === layer.name ? { ...l, isVisible: newState } : l))
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      <header style={{ padding: "8px 16px", background: "#1976d2", color: "#fff", flexShrink: 0 }}>
+        <input type="file" accept=".dxf" onChange={handleFile} />
+      </header>
+
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        <div style={{ flex: 1, position: "relative" }}>
+          <DxfViewerComponent dxfUrl={dxfUrl} onLayers={handleLayers} />
+        </div>
+
+        {layers && (
+          <div style={{ width: 240, borderLeft: "1px solid #ddd", overflowY: "auto", padding: 8 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13, textTransform: "uppercase" }}>
+              Layers
+            </div>
+            {layers.map(layer => (
+              <LayerRow key={layer.name} layer={layer} onToggle={toggleLayer} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 ```
 
-Usage:
+> **Note on layer visibility with React:** Because `ShowLayer()` is a method on the viewer instance, you need access to the `DxfViewer` object. The cleanest approach is to expose a ref from your wrapper component or use a shared ref pattern. The example above shows the state-tracking side; wire it to `viewer.ShowLayer()` via a forwarded ref.
 
-```jsx
-// Local file
-const [url, setUrl] = useState(null)
+---
 
-function handleFile(e) {
+## Vanilla JS Integration
+
+A complete, framework-free integration. All you need is an HTML file and a bundler (or native ES modules in a modern browser).
+
+### Project structure
+
+```
+my-dxf-app/
+  index.html
+  main.js
+  DxfViewerWorker.js
+  fonts/
+    Roboto-LightItalic.ttf
+```
+
+### DxfViewerWorker.js
+
+```js
+import { DxfViewer } from "dxf-viewer"
+DxfViewer.SetupWorker()
+```
+
+### main.js
+
+```js
+import { DxfViewer } from "dxf-viewer"
+import * as THREE from "three"
+
+// ── Setup ──────────────────────────────────────────────────────────────────
+const container = document.getElementById("viewer")
+const statusEl  = document.getElementById("status")
+const layersEl  = document.getElementById("layers")
+
+const viewer = new DxfViewer(container, {
+  clearColor:      new THREE.Color("#1e1e2e"),
+  autoResize:      true,
+  colorCorrection: true,
+})
+
+// ── Worker factory ─────────────────────────────────────────────────────────
+// For Vite/modern bundlers:
+const workerFactory = () =>
+  new Worker(new URL("./DxfViewerWorker.js", import.meta.url), { type: "module" })
+
+// ── Fonts ─────────────────────────────────────────────────────────────────
+const fonts = [
+  new URL("./fonts/Roboto-LightItalic.ttf", import.meta.url).href,
+]
+
+// ── Events ─────────────────────────────────────────────────────────────────
+viewer.Subscribe("loaded", () => {
+  renderLayers(viewer.GetLayers(true))
+})
+
+viewer.Subscribe("cleared", () => {
+  layersEl.innerHTML = ""
+})
+
+viewer.Subscribe("message", (e) => {
+  const { level, message } = e.detail
+  const isError = level === DxfViewer.MessageLevel.ERROR
+  console[isError ? "error" : "warn"]("[dxf]", message)
+})
+
+// ── File input ─────────────────────────────────────────────────────────────
+let currentBlobUrl = null
+
+document.getElementById("fileInput").addEventListener("change", async (e) => {
   const file = e.target.files[0]
-  const blobUrl = URL.createObjectURL(file)
-  setUrl(prev => { if (prev) URL.revokeObjectURL(prev); return blobUrl })
+  if (!file) return
+
+  // Revoke previous blob URL
+  if (currentBlobUrl) {
+    URL.revokeObjectURL(currentBlobUrl)
+    currentBlobUrl = null
+  }
+
+  currentBlobUrl = URL.createObjectURL(file)
+  setStatus("Loading...")
+
+  try {
+    await viewer.Load({
+      url:          currentBlobUrl,
+      fonts,
+      workerFactory,
+      progressCbk:  onProgress,
+    })
+    setStatus("")
+  } catch (err) {
+    setStatus("Error: " + err.message)
+    console.error(err)
+  }
+})
+
+// ── Progress ───────────────────────────────────────────────────────────────
+const phaseLabels = {
+  font:    "Fetching fonts...",
+  fetch:   "Fetching file...",
+  parse:   "Parsing file...",
+  prepare: "Preparing rendering data...",
 }
 
-<input type="file" accept=".dxf" onChange={handleFile} />
-<div style={{ height: "calc(100vh - 40px)" }}>
-  <DxfViewerComponent dxfUrl={url} />
-</div>
+function onProgress(phase, size, totalSize) {
+  const label = phaseLabels[phase] ?? phase
+  if (totalSize === null) {
+    setStatus(label)
+  } else {
+    const pct = Math.round((size / totalSize) * 100)
+    setStatus(`${label} ${pct}%`)
+  }
+}
+
+function setStatus(text) {
+  statusEl.textContent = text
+}
+
+// ── Layers ─────────────────────────────────────────────────────────────────
+function layerColorToCss(colorInt) {
+  return "#" + colorInt.toString(16).padStart(6, "0")
+}
+
+function renderLayers(layers) {
+  layersEl.innerHTML = ""
+
+  const heading = document.createElement("div")
+  heading.textContent = "Layers"
+  heading.style.cssText = "font-weight:600;margin-bottom:8px;font-size:13px;text-transform:uppercase;"
+  layersEl.appendChild(heading)
+
+  layers.forEach(layer => {
+    const row = document.createElement("label")
+    row.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;"
+
+    const swatch = document.createElement("span")
+    swatch.style.cssText = `display:inline-block;width:10px;height:10px;border-radius:2px;background:${layerColorToCss(layer.color)};`
+
+    const cb = document.createElement("input")
+    cb.type    = "checkbox"
+    cb.checked = true
+    cb.addEventListener("change", () => viewer.ShowLayer(layer.name, cb.checked))
+
+    const label = document.createElement("span")
+    label.textContent = layer.displayName
+    label.style.fontSize = "13px"
+
+    row.appendChild(swatch)
+    row.appendChild(cb)
+    row.appendChild(label)
+    layersEl.appendChild(row)
+  })
+}
+
+// ── Cleanup ────────────────────────────────────────────────────────────────
+window.addEventListener("beforeunload", () => {
+  viewer.Destroy()
+  if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl)
+})
+```
+
+### index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DXF Viewer</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: system-ui, sans-serif;
+    }
+
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      background: #1976d2;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    #status {
+      font-size: 13px;
+      opacity: 0.85;
+    }
+
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    #viewer {
+      flex: 1;
+      position: relative;
+      min-width: 0;
+    }
+
+    #layers {
+      width: 240px;
+      border-left: 1px solid #ddd;
+      overflow-y: auto;
+      padding: 8px;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="toolbar">
+      <label>
+        <strong>Open DXF:</strong>
+        <input id="fileInput" type="file" accept=".dxf" />
+      </label>
+      <span id="status"></span>
+    </div>
+    <div class="main">
+      <div id="viewer"></div>
+      <div id="layers"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
 ```
 
 ---
 
-## Common Patterns
+## Common Patterns & Tips
 
-### Revoke blob URLs
+### Always revoke blob URLs
 
-Always revoke blob URLs after loading to free memory:
+Blob URLs created from `File` objects hold a reference to the file data in memory. You must call `URL.revokeObjectURL()` when the URL is no longer needed. The best place is after `Load()` resolves (or rejects), not before — the viewer fetches the URL asynchronously.
 
 ```js
 const url = URL.createObjectURL(file)
 try {
   await viewer.Load({ url, fonts, workerFactory })
+} catch (err) {
+  console.error(err)
 } finally {
-  URL.revokeObjectURL(url)
+  URL.revokeObjectURL(url)  // always clean up
 }
 ```
 
-### Load from URL query parameter
+If you store the blob URL in state (to pass it as a prop), revoke it when the user selects a new file or clears:
 
 ```js
-const params = new URL(location.href).searchParams
-const dxfUrl = params.get("dxfUrl")
-if (dxfUrl) {
+let currentBlobUrl = null
+
+function loadFile(file) {
+  if (currentBlobUrl) {
+    URL.revokeObjectURL(currentBlobUrl)
+  }
+  currentBlobUrl = URL.createObjectURL(file)
+  return currentBlobUrl
+}
+```
+
+### Always destroy the viewer on unmount
+
+WebGL contexts are a limited resource. If you create a viewer in a component, always destroy it when the component is removed:
+
+```js
+// Vue 2
+destroyed() {
+  this.dxfViewer.Destroy()
+}
+
+// Vue 3
+onUnmounted(() => {
+  viewer.Destroy()
+})
+
+// React
+useEffect(() => {
+  const viewer = new DxfViewer(container, options)
+  return () => viewer.Destroy()   // cleanup on unmount
+}, [])
+```
+
+### Load from a URL query parameter
+
+A common pattern for shareable DXF links:
+
+```js
+// On page load, check for a ?dxfUrl= parameter
+const searchParams = new URL(location.href).searchParams
+const dxfUrl = searchParams.get("dxfUrl")
+
+if (dxfUrl && URL.canParse(dxfUrl)) {
   await viewer.Load({ url: dxfUrl, fonts, workerFactory })
 }
 ```
 
-### Log all viewer warnings and errors
+To generate a shareable link:
+
+```js
+const shareUrl = new URL(location.href)
+shareUrl.searchParams.set("dxfUrl", "https://example.com/drawing.dxf")
+console.log(shareUrl.toString())
+```
+
+### Using a CORS proxy for remote URLs
+
+When loading DXF files from a third-party server that does not send CORS headers, the browser will block the request. Options:
+
+1. **Own proxy** — serve the DXF through your own backend, which fetches and re-serves it.
+2. **AllOrigins** (development/demo only) — prepend `https://api.allorigins.win/raw?url=`:
+
+```js
+function proxiedUrl(rawUrl) {
+  return "https://api.allorigins.win/raw?url=" + encodeURIComponent(rawUrl)
+}
+
+await viewer.Load({ url: proxiedUrl(userInputUrl), fonts, workerFactory })
+```
+
+> Do not rely on third-party CORS proxies in production. They can go offline, rate-limit, or be blocked.
+
+### Surface viewer warnings in the UI
+
+The `"message"` event fires for non-fatal issues the parser encounters (unsupported entities, missing blocks, etc.). In production, surface these to help users understand incomplete renders:
 
 ```js
 viewer.Subscribe("message", (e) => {
-  const prefix = `[dxf-viewer] ${e.detail.level === DxfViewer.MessageLevel.ERROR ? "ERROR" : "WARN"}`
-  console.warn(prefix, e.detail.message)
+  const { level, message } = e.detail
+  const isError = level === DxfViewer.MessageLevel.ERROR
+
+  // Log to console always
+  console[isError ? "error" : "warn"]("[dxf-viewer]", message)
+
+  // Optionally show a toast/snackbar to the user
+  showNotification({ type: isError ? "error" : "warning", text: message })
 })
+```
+
+### Replace a file without destroying the viewer
+
+Call `viewer.Clear()` and then `viewer.Load(...)` again. There is no need to re-create the viewer:
+
+```js
+async function replaceFile(newFile) {
+  viewer.Clear()
+
+  const url = URL.createObjectURL(newFile)
+  try {
+    await viewer.Load({ url, fonts, workerFactory })
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+```
+
+### React: don't create the viewer inside render
+
+Always create the viewer in a `useEffect` (runs after mount), never in the component body or render function — those run before the DOM element is attached.
+
+```js
+// CORRECT
+useEffect(() => {
+  const viewer = new DxfViewer(containerRef.current, options)
+  // ...
+}, [])
+
+// WRONG — containerRef.current is null during render
+const viewer = new DxfViewer(containerRef.current, options)  // DO NOT DO THIS
+```
+
+### Controlling background color dynamically
+
+You can change the background after instantiation by passing a different `clearColor` at construction time, or by creating a new viewer. Currently there is no setter for `clearColor` after construction — bake the desired background into your options at startup.
+
+```js
+// Light mode
+const viewer = new DxfViewer(container, { clearColor: new THREE.Color("#ffffff"), ... })
+
+// Dark mode
+const viewer = new DxfViewer(container, { clearColor: new THREE.Color("#1a1a2e"), ... })
 ```
 
 ---
 
 ## Troubleshooting
 
-**Text is not showing**
-You forgot `fonts` in `Load()`. Text is completely skipped without fonts. Provide at least one TTF font URL.
+### Text is not showing
 
-**Blank canvas**
-The container element has no height. Set an explicit `height` (px, %, vh) via CSS. `height: 100%` requires the parent to also have a height.
+**Cause:** `fonts` was not passed to `Load()`, or the font array is empty.
 
-**`workerFactory` error / parsing hangs**
-The Web Worker is not set up. Make sure you have a `DxfViewerWorker.js` that calls `DxfViewer.SetupWorker()` and pass it correctly to `Load()`.
+**Fix:** Provide at least one TTF font URL in the `fonts` array. Text rendering is entirely skipped if `fonts` is `null` or `[]`.
 
-**CORS error when loading remote DXF**
-The DXF server doesn't allow cross-origin requests. Either host the file yourself, configure CORS headers on the server, or use a CORS proxy (`https://api.allorigins.win/raw?url=<encoded-url>`).
-
-**Webpack build errors with dxf-viewer**
-The package uses modern JS syntax — add it to your transpile list:
 ```js
-// vue.config.js
-transpileDependencies: [/node_modules[\\/]dxf-viewer[\\/]/]
+await viewer.Load({
+  url,
+  fonts: ["/fonts/Roboto-LightItalic.ttf"],   // required for text
+  workerFactory,
+})
 ```
-Or in raw Webpack, include it in your `babel-loader` rule.
 
-**WebGL context lost**
-Usually caused by too many WebGL contexts on the page. Call `viewer.Destroy()` when you no longer need a viewer instance.
+---
+
+### Canvas is blank / viewer shows nothing
+
+**Likely cause:** The container element has zero height.
+
+The viewer fills its container. If the container has no CSS height, the canvas is 0px tall and nothing renders.
+
+**Fix:** Give the container an explicit height:
+
+```css
+/* Option A: fill viewport */
+html, body { height: 100%; margin: 0; }
+#viewer { width: 100%; height: 100%; }
+
+/* Option B: fixed size */
+#viewer { width: 800px; height: 600px; }
+
+/* Option C: flex child */
+.layout { display: flex; height: 100vh; }
+#viewer { flex: 1; }
+```
+
+Check in DevTools that the container's computed height is greater than 0.
+
+---
+
+### Worker not set up / `workerFactory is not a constructor`
+
+**Cause:** `workerFactory` was not passed, was `undefined`, or the worker file is wrong.
+
+**Fix:**
+
+1. Create `DxfViewerWorker.js`:
+   ```js
+   import { DxfViewer } from "dxf-viewer"
+   DxfViewer.SetupWorker()
+   ```
+
+2. Import it correctly for your bundler:
+   - **Webpack/Vue CLI:** `import DxfViewerWorker from "worker-loader!./DxfViewerWorker.js"`
+   - **Vite:** `() => new Worker(new URL("./DxfViewerWorker.js", import.meta.url), { type: "module" })`
+
+3. Pass it to `Load()`:
+   ```js
+   await viewer.Load({ url, fonts, workerFactory: DxfViewerWorker })
+   ```
+
+---
+
+### CORS error when loading a remote DXF
+
+**Error in console:** `Access to fetch at 'https://...' has been blocked by CORS policy`
+
+**Cause:** The remote server does not include the `Access-Control-Allow-Origin` header.
+
+**Fixes (in order of preference):**
+1. Host the DXF file on your own domain or a CDN you control and configure CORS headers.
+2. Proxy the request through your own backend server.
+3. For development/demos only: prepend `https://api.allorigins.win/raw?url=` to the URL.
+
+---
+
+### Webpack build errors / `Unexpected token`
+
+**Cause:** `dxf-viewer` ships untranspiled modern JavaScript. Webpack (especially older Vue CLI 4/5 setups) doesn't transpile `node_modules` by default.
+
+**Fix for Vue CLI (`vue.config.js`):**
+```js
+module.exports = {
+  transpileDependencies: [
+    /[\\\/]node_modules[\\\/]dxf-viewer[\\\/]/,
+  ],
+}
+```
+
+**Fix for raw Webpack:**
+```js
+// webpack.config.js
+module: {
+  rules: [
+    {
+      test: /\.js$/,
+      include: [
+        path.resolve(__dirname, "src"),
+        path.resolve(__dirname, "node_modules/dxf-viewer"),
+      ],
+      use: "babel-loader",
+    },
+  ],
+},
+```
+
+---
+
+### WebGL context lost
+
+**Symptom:** Drawing disappears, browser console shows `WebGL: CONTEXT_LOST_WEBGL`.
+
+**Causes:**
+- Too many WebGL contexts on the page (browsers limit this to ~8–16).
+- GPU driver reset.
+
+**Fix:**
+- Call `viewer.Destroy()` whenever you remove the viewer from the page. This releases the context.
+- Avoid creating multiple viewer instances simultaneously — one at a time is best.
+
+---
+
+### `viewer.GetLayers()` returns an empty array
+
+**Cause:** Called before the DXF has finished loading.
+
+**Fix:** Only call `GetLayers()` inside a `"loaded"` event handler (or after `await viewer.Load(...)` resolves):
+
+```js
+viewer.Subscribe("loaded", () => {
+  const layers = viewer.GetLayers(true)   // safe here
+  // ...
+})
+
+// Or:
+await viewer.Load({ url, fonts, workerFactory })
+const layers = viewer.GetLayers(true)     // safe after await
+```
